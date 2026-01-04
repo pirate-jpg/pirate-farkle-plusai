@@ -1,31 +1,24 @@
 // public/app.js
 const socket = io();
 
-let roomCode = null;
-let mySeat = null;
-
-let state = null;
-let selected = new Set();
-
 const $ = (id) => document.getElementById(id);
 
 const connPill = $("connPill");
+
 const joinBox = $("joinBox");
 const tableBox = $("tableBox");
-const codeValue = $("codeValue");
 
 const nameInput = $("nameInput");
 const roomInput = $("roomInput");
+
 const createBtn = $("createBtn");
 const joinBtn = $("joinBtn");
 const newGameBtn = $("newGameBtn");
 
-const p0Name = $("p0Name");
-const p0Score = $("p0Score");
-const p0Meta = $("p0Meta");
-const p1Name = $("p1Name");
-const p1Score = $("p1Score");
-const p1Meta = $("p1Meta");
+const codeValue = $("codeValue");
+
+const p0Name = $("p0Name"), p0Score = $("p0Score"), p0Meta = $("p0Meta");
+const p1Name = $("p1Name"), p1Score = $("p1Score"), p1Meta = $("p1Meta");
 
 const turnPointsEl = $("turnPoints");
 const keepDetail = $("keepDetail");
@@ -43,7 +36,44 @@ const modalOverlay = $("modalOverlay");
 const modalTitle = $("modalTitle");
 const modalBody = $("modalBody");
 const modalOkBtn = $("modalOkBtn");
+
 const toastEl = $("toast");
+
+// --- per-tab identity (THIS prevents your tab-vs-private tab collision)
+function getClientId() {
+  const key = "pirateFarkleClientId";
+  let id = sessionStorage.getItem(key);
+  if (!id) {
+    id = (crypto?.randomUUID?.() || Math.random().toString(16).slice(2) + Date.now().toString(16));
+    sessionStorage.setItem(key, id);
+  }
+  return id;
+}
+const clientId = getClientId();
+
+// Persist room + seat per tab
+let roomCode = sessionStorage.getItem("pirateFarkleRoom") || null;
+let mySeat = sessionStorage.getItem("pirateFarkleSeat");
+mySeat = mySeat === null ? null : Number(mySeat);
+
+function setJoined(code, seat) {
+  roomCode = code;
+  mySeat = seat;
+  sessionStorage.setItem("pirateFarkleRoom", code);
+  sessionStorage.setItem("pirateFarkleSeat", String(seat));
+}
+
+function clearJoined() {
+  roomCode = null;
+  mySeat = null;
+  sessionStorage.removeItem("pirateFarkleRoom");
+  sessionStorage.removeItem("pirateFarkleSeat");
+}
+
+function log(msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  logEl.textContent = line + logEl.textContent;
+}
 
 function showToast(msg) {
   toastEl.textContent = msg;
@@ -56,162 +86,132 @@ function showModal(title, body) {
   modalBody.textContent = body;
   modalOverlay.classList.remove("hidden");
 }
-
-function hideModal() {
-  modalOverlay.classList.add("hidden");
-}
-
-modalOkBtn.addEventListener("click", hideModal);
-
-function log(msg) {
-  const line = document.createElement("div");
-  line.className = "logLine";
-  line.textContent = msg;
-  logEl.prepend(line);
-}
+modalOkBtn.addEventListener("click", () => modalOverlay.classList.add("hidden"));
 
 function setConnected(isConnected) {
   connPill.textContent = isConnected ? "Connected" : "Disconnected";
-  connPill.classList.toggle("good", isConnected);
-  connPill.classList.toggle("bad", !isConnected);
+  connPill.classList.toggle("connected", isConnected);
 }
 
-function uiInRoom(inRoom) {
-  joinBox.classList.toggle("hidden", inRoom);
-  tableBox.classList.toggle("hidden", !inRoom);
+function setUIJoined(joined) {
+  joinBox.classList.toggle("hidden", joined);
+  tableBox.classList.toggle("hidden", !joined);
 }
 
-function diceChar(n) {
-  // unicode dice 1-6
-  const map = ["", "⚀","⚁","⚂","⚃","⚄","⚅"];
-  return map[n] || "□";
-}
-
-function renderDice(dice, keptMask) {
+function renderDice(dice, held, canSelect) {
   diceGrid.innerHTML = "";
   for (let i = 0; i < 6; i++) {
-    const btn = document.createElement("button");
-    btn.className = "die";
-    const isKept = keptMask?.[i];
-    const isSel = selected.has(i);
-
-    btn.textContent = dice[i] ? diceChar(dice[i]) : "□";
-    if (isKept) btn.classList.add("kept");
-    if (isSel) btn.classList.add("selected");
-
-    btn.disabled = !!isKept || !dice[i]; // can't select kept or empty
-    btn.addEventListener("click", () => {
-      if (selected.has(i)) selected.delete(i);
-      else selected.add(i);
-      renderDice(state.game.dice, state.game.keptMask);
+    const die = document.createElement("div");
+    die.className = "die" + (held[i] ? " held" : "");
+    die.textContent = String(dice[i]);
+    die.addEventListener("click", () => {
+      if (!canSelect) return;
+      socket.emit("turn:toggleHold", { idx: i });
     });
-
-    diceGrid.appendChild(btn);
+    diceGrid.appendChild(die);
   }
 }
 
-function updateUI() {
-  if (!state) return;
-
+function updateFromState(state) {
+  // Table
   codeValue.textContent = state.code || "—";
 
-  // players
-  p0Name.textContent = state.players[0].name;
-  p0Score.textContent = String(state.players[0].score);
-  p0Meta.textContent = state.players[0].online ? (mySeat === 0 ? "You" : "Online") : "Offline";
+  const players = state.players || [];
+  const a = players[0] || { name: "—", score: 0, online: false };
+  const b = players[1] || { name: "—", score: 0, online: false };
 
-  p1Name.textContent = state.players[1].name;
-  p1Score.textContent = String(state.players[1].score);
-  p1Meta.textContent = state.players[1].online ? (mySeat === 1 ? "You" : "Online") : "Offline";
+  p0Name.textContent = a.name;
+  p0Score.textContent = a.score;
+  p0Meta.textContent = a.online ? "Online" : "Offline";
 
-  // game header
-  turnPointsEl.textContent = String(state.game.turnPoints || 0);
+  p1Name.textContent = b.name;
+  p1Score.textContent = b.score;
+  p1Meta.textContent = b.online ? "Online" : "Offline";
 
-  const started = state.game.started;
-  const finished = state.game.phase === "finished";
+  // Turn / controls
+  turnPointsEl.textContent = String(state.turnPoints ?? 0);
 
-  if (!started) {
+  const bothJoined = players.every(p => p && p.name && p.name !== "—");
+
+  const isMyTurn = (mySeat !== null) && (state.activeSeat === mySeat) && state.phase === "turn";
+  const canRoll = !!state.canRoll;
+  const canSelectDice = isMyTurn && !canRoll; // after roll, before keep/bank
+  const canKeep = isMyTurn && !canRoll;       // must have rolled
+  const canBank = isMyTurn;                   // can bank anytime on your turn
+
+  if (!bothJoined) {
     turnTag.textContent = "Waiting…";
     turnHint.textContent = "Waiting for both players to join.";
-  } else if (finished) {
-    const winner = state.game.winnerSeat;
-    turnTag.textContent = "Game over";
-    turnHint.textContent = winner === null ? "—" : `${state.players[winner].name} wins!`;
-    showModal("Game over", `${state.players[winner].name} wins!`);
+  } else if (state.phase !== "turn") {
+    turnTag.textContent = "Waiting…";
+    turnHint.textContent = "Press New game to start.";
+  } else if (isMyTurn) {
+    turnTag.textContent = "Your turn";
+    turnHint.textContent = canRoll ? "Press ROLL." : "Select scoring dice, then KEEP (or BANK).";
   } else {
-    const isMyTurn = mySeat === state.game.turnSeat;
-    turnTag.textContent = isMyTurn ? "Your turn" : "Opponent's turn";
-    if (state.game.phase === "must_roll") {
-      turnHint.textContent = isMyTurn ? "Press ROLL." : "Waiting for opponent to roll.";
-    } else if (state.game.phase === "selecting") {
-      turnHint.textContent = isMyTurn ? "Select scoring dice, KEEP, then roll or BANK." : "Opponent selecting dice…";
-    } else {
-      turnHint.textContent = "—";
-    }
+    turnTag.textContent = "Opponent's turn";
+    turnHint.textContent = "Waiting for opponent…";
   }
 
-  keepDetail.textContent = state.game.lastAction || "—";
+  rollBtn.disabled = !(isMyTurn && canRoll);
+  keepBtn.disabled = !canKeep;
+  bankBtn.disabled = !canBank;
 
-  renderDice(state.game.dice, state.game.keptMask);
+  keepDetail.textContent = canSelectDice ? "Tap dice to select scoring dice." : "—";
 
-  const canAct = started && !finished && mySeat === state.game.turnSeat;
-  rollBtn.disabled = !canAct;
-  keepBtn.disabled = !canAct || selected.size === 0;
-  bankBtn.disabled = !canAct || (state.game.turnPoints || 0) <= 0;
-
-  if (state.game.lastAction) log(state.game.lastAction);
+  renderDice(state.dice || [1,1,1,1,1,1], state.held || [false,false,false,false,false,false], canSelectDice);
 }
 
 createBtn.addEventListener("click", () => {
-  const name = nameInput.value.trim() || "Player";
-  socket.emit("create_table", { name });
+  const name = (nameInput.value || "Player").trim();
+  socket.emit("room:create", { name, clientId });
 });
 
 joinBtn.addEventListener("click", () => {
-  const name = nameInput.value.trim() || "Player";
-  const code = roomInput.value.trim().toUpperCase();
+  const code = (roomInput.value || "").trim().toUpperCase();
+  const name = (nameInput.value || "Player").trim();
   if (!code) return showToast("Enter a table code.");
-  socket.emit("join_table", { code, name });
+  socket.emit("room:join", { code, name, clientId });
 });
 
-newGameBtn.addEventListener("click", () => {
-  socket.emit("new_game");
-});
+newGameBtn.addEventListener("click", () => socket.emit("game:new"));
+rollBtn.addEventListener("click", () => socket.emit("turn:roll"));
+keepBtn.addEventListener("click", () => socket.emit("turn:keep"));
+bankBtn.addEventListener("click", () => socket.emit("turn:bank"));
 
-rollBtn.addEventListener("click", () => {
-  selected.clear();
-  socket.emit("roll");
-});
+socket.on("connect", () => {
+  setConnected(true);
+  log("Socket connected.");
 
-keepBtn.addEventListener("click", () => {
-  const indices = [...selected.values()].sort((a,b)=>a-b);
-  selected.clear();
-  socket.emit("keep", { indices });
-});
-
-bankBtn.addEventListener("click", () => {
-  selected.clear();
-  socket.emit("bank");
-});
-
-// Socket events
-socket.on("connect", () => setConnected(true));
-socket.on("disconnect", () => setConnected(false));
-
-socket.on("toast", ({ msg }) => showToast(msg));
-
-socket.on("you_are", ({ code, seat }) => {
-  roomCode = code;
-  mySeat = seat;
-  uiInRoom(true);
-  showToast(`Joined table ${code} (seat ${seat}).`);
-});
-
-socket.on("state", (s) => {
-  state = s;
-  if (s?.code) {
-    roomCode = s.code;
-    uiInRoom(true);
+  // If we previously joined (per tab), attempt re-join as reconnect
+  if (roomCode && typeof mySeat === "number") {
+    const name = (nameInput.value || "Player").trim();
+    socket.emit("room:join", { code: roomCode, name, clientId });
   }
-  updateUI();
+});
+
+socket.on("disconnect", () => {
+  setConnected(false);
+  log("Socket disconnected.");
+});
+
+socket.on("room:joined", ({ code, seat }) => {
+  setJoined(code, seat);
+  setUIJoined(true);
+  showToast(`Joined ${code} as seat ${seat}.`);
+  log(`Joined room ${code} seat ${seat}.`);
+});
+
+socket.on("room:update", (state) => {
+  // If we have a room state, consider ourselves in-table view.
+  if (state && state.code) setUIJoined(true);
+  updateFromState(state);
+});
+
+socket.on("toast", ({ msg }) => {
+  if (msg) showToast(msg);
+});
+
+socket.on("modal", ({ title, body }) => {
+  showModal(title || "Notice", body || "");
 });
