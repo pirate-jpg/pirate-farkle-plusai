@@ -2,516 +2,629 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
 
-// Railway / production port handling
 const PORT = process.env.PORT || 3000;
 
 // Serve static files
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static("public"));
 
 // Basic health check
-app.get("/health", (req, res) => res.json({ status: "ok", game: "pirate-farkle-plusai" }));
-
-server.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", game: "pirate-farkle" });
 });
 
 /**
- * Farkle rules (standard-ish):
- * - 1 = 100, 5 = 50
- * - 3-of-kind: 100*face (except 1s = 1000)
- * - 4/5/6-of-kind: doubles each extra die (x2^(n-3))
- * - straight (1-6): 1500 (must use all 6 dice)
- * - three pairs: 1500 (must use all 6 dice)
- * - two triplets: 2500 (must use all 6 dice)
- * Winning score: 10,000
+ * FARKLE RULES (standard-ish, with combos enabled)
+ * - Single 1 = 100
+ * - Single 5 = 50
+ * - 3 of a kind: 1s=1000, 2-6 = face*100
+ * - 4/5/6 of a kind: double/triple/quadruple the triple score
+ * - Straight 1-6 = 1500
+ * - Three pairs = 1500
+ * - Two triplets = 2500
+ * - Four of a kind + a pair = 1500
+ * - Hot dice: if all dice score/are kept, reset kept and roll all 6 again in same turn
  */
 
-const WIN_SCORE = 10000;
+function countFaces(dice) {
+  const counts = new Array(7).fill(0);
+  for (const d of dice) counts[d] += 1;
+  return counts;
+}
 
-// In-memory rooms: roomCode -> roomState
-const rooms = new Map();
+function isStraight(counts) {
+  for (let f = 1; f <= 6; f++) if (counts[f] !== 1) return false;
+  return true;
+}
 
-function makeRoomCode() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 5; i++) code += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return code;
+function isThreePairs(counts) {
+  let pairs = 0;
+  for (let f = 1; f <= 6; f++) if (counts[f] === 2) pairs++;
+  return pairs === 3;
+}
+
+function isTwoTriplets(counts) {
+  let trips = 0;
+  for (let f = 1; f <= 6; f++) if (counts[f] === 3) trips++;
+  return trips === 2;
+}
+
+function isFourPlusPair(counts) {
+  let has4 = false;
+  let has2 = false;
+  for (let f = 1; f <= 6; f++) {
+    if (counts[f] === 4) has4 = true;
+    if (counts[f] === 2) has2 = true;
+  }
+  return has4 && has2;
+}
+
+function scoreNOfAKind(face, n) {
+  // base triple
+  let base = face === 1 ? 1000 : face * 100;
+  if (n === 3) return base;
+  if (n === 4) return base * 2;
+  if (n === 5) return base * 3;
+  if (n === 6) return base * 4;
+  return 0;
+}
+
+/**
+ * Compute score + which dice are "scoring-selectable" for KEEP
+ * for the CURRENT ROLL (only considers non-kept dice).
+ *
+ * We allow KEEP to include:
+ * - any dice that are part of a scoring set (combos or n-of-kind)
+ * - any single 1 or 5
+ *
+ * Note: combos (straight/three-pairs/two-triplets/four+pair) consume ALL dice in the roll.
+ */
+function evaluateRoll(diceValues) {
+  // diceValues length can be 1..6 (only the unkept dice)
+  const counts = countFaces(diceValues);
+  const selectable = new Array(diceValues.length).fill(false);
+
+  // combos that consume all dice (must be exactly 6 dice in roll)
+  if (diceValues.length === 6) {
+    if (isStraight(counts)) {
+      return {
+        rollScore: 1500,
+        selectable: selectable.map(() => true),
+        combo: "Straight (1–6)",
+        comboConsumesAll: true,
+      };
+    }
+    if (isThreePairs(counts)) {
+      return {
+        rollScore: 1500,
+        selectable: selectable.map(() => true),
+        combo: "Three pairs",
+        comboConsumesAll: true,
+      };
+    }
+    if (isTwoTriplets(counts)) {
+      return {
+        rollScore: 2500,
+        selectable: selectable.map(() => true),
+        combo: "Two triplets",
+        comboConsumesAll: true,
+      };
+    }
+    if (isFourPlusPair(counts)) {
+      return {
+        rollScore: 1500,
+        selectable: selectable.map(() => true),
+        combo: "Four of a kind + a pair",
+        comboConsumesAll: true,
+      };
+    }
+  }
+
+  // mark n-of-kind dice as selectable
+  for (let face = 1; face <= 6; face++) {
+    if (counts[face] >= 3) {
+      // all dice of that face are selectable
+      for (let i = 0; i < diceValues.length; i++) {
+        if (diceValues[i] === face) selectable[i] = true;
+      }
+    }
+  }
+
+  // singles: 1s and 5s selectable (even if also part of n-of-kind)
+  for (let i = 0; i < diceValues.length; i++) {
+    if (diceValues[i] === 1 || diceValues[i] === 5) selectable[i] = true;
+  }
+
+  // rollScore here is NOT what you'll get by selecting arbitrary dice.
+  // It’s just "there exists scoring" indicator, but we compute selection score separately.
+  const hasScoring = selectable.some(Boolean);
+  return {
+    rollScore: hasScoring ? 1 : 0,
+    selectable,
+    combo: null,
+    comboConsumesAll: false,
+  };
+}
+
+/**
+ * Score a selection of dice (subset of a roll) with the same rules.
+ * This must:
+ * - validate the selection is purely scoring
+ * - compute points for that selection
+ *
+ * We support:
+ * - selecting all 6 to claim a combo
+ * - selecting n-of-kind sets (3/4/5/6)
+ * - selecting single 1s and 5s
+ *
+ * If selection includes non-scoring dice -> invalid
+ */
+function scoreSelection(selectedValues) {
+  if (selectedValues.length === 0) return { ok: false, points: 0, detail: "No dice selected." };
+
+  const counts = countFaces(selectedValues);
+
+  // If selecting 6 dice, allow combos that consume all
+  if (selectedValues.length === 6) {
+    if (isStraight(counts)) return { ok: true, points: 1500, detail: "Straight (1–6) = 1500" };
+    if (isThreePairs(counts)) return { ok: true, points: 1500, detail: "Three pairs = 1500" };
+    if (isTwoTriplets(counts)) return { ok: true, points: 2500, detail: "Two triplets = 2500" };
+    if (isFourPlusPair(counts)) return { ok: true, points: 1500, detail: "Four + pair = 1500" };
+  }
+
+  // Score n-of-kind sets
+  let points = 0;
+  let detailParts = [];
+
+  // First, handle 3+ of a kind
+  for (let face = 1; face <= 6; face++) {
+    const n = counts[face];
+    if (n >= 3) {
+      const p = scoreNOfAKind(face, n);
+      points += p;
+      detailParts.push(`${n}×${face}${face === 1 ? "s" : "s"} = ${p}`);
+      counts[face] = 0; // consume all of that face
+    }
+  }
+
+  // Remaining dice must be only 1s or 5s as singles
+  let ones = counts[1] || 0;
+  let fives = counts[5] || 0;
+
+  // Any remaining non-1/5 dice => invalid selection
+  for (let face = 2; face <= 6; face++) {
+    if (face === 5) continue;
+    if (counts[face] > 0) {
+      return { ok: false, points: 0, detail: "Selection contains non-scoring dice." };
+    }
+  }
+
+  if (ones > 0) {
+    const p = ones * 100;
+    points += p;
+    detailParts.push(`${ones}×1 = ${p}`);
+  }
+  if (fives > 0) {
+    const p = fives * 50;
+    points += p;
+    detailParts.push(`${fives}×5 = ${p}`);
+  }
+
+  if (points <= 0) return { ok: false, points: 0, detail: "Selection has no scoring value." };
+  return { ok: true, points, detail: detailParts.join(" + ") };
 }
 
 function rollDie() {
-  return 1 + Math.floor(Math.random() * 6);
+  return Math.floor(Math.random() * 6) + 1;
 }
 
-function clone(obj) {
-  return JSON.parse(JSON.stringify(obj));
+function makeCode(len = 5) {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // avoid O/0/I/1 confusion
+  let s = "";
+  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
 }
 
-/**
- * Returns true if the given counts (face->count) contains ANY scoring combination.
- */
-function hasAnyScoring(counts) {
-  // Straight
-  let isStraight = true;
-  for (let f = 1; f <= 6; f++) {
-    if ((counts[f] || 0) !== 1) {
-      isStraight = false;
-      break;
-    }
-  }
-  if (isStraight) return true;
-
-  // Three pairs
-  let pairs = 0;
-  let total = 0;
-  for (let f = 1; f <= 6; f++) {
-    const c = counts[f] || 0;
-    total += c;
-    if (c === 2) pairs++;
-  }
-  if (total === 6 && pairs === 3) return true;
-
-  // Two triplets
-  let triplets = 0;
-  total = 0;
-  for (let f = 1; f <= 6; f++) {
-    const c = counts[f] || 0;
-    total += c;
-    if (c === 3) triplets++;
-  }
-  if (total === 6 && triplets === 2) return true;
-
-  // Any 1 or 5
-  if ((counts[1] || 0) > 0) return true;
-  if ((counts[5] || 0) > 0) return true;
-
-  // Any 3+ of a kind
-  for (let f = 1; f <= 6; f++) {
-    if ((counts[f] || 0) >= 3) return true;
-  }
-  return false;
-}
-
-/**
- * Score a selection of dice (values array length 1..6).
- * Returns { ok: boolean, score: number, detail: string }.
- *
- * IMPORTANT validity rule:
- * - Every die in the selection must be part of a scoring pattern.
- * - Allowed patterns:
- *   * Straight (1-6) [all 6 dice]
- *   * Three pairs [all 6 dice]
- *   * Two triplets [all 6 dice]
- *   * N-of-kind (>=3)
- *   * Singles: 1s and 5s
- * - Any leftover non-scoring die in the selection => invalid.
- */
-function scoreSelection(values) {
-  if (!Array.isArray(values) || values.length === 0) return { ok: false, score: 0, detail: "No dice selected." };
-
-  const counts = {};
-  for (const v of values) counts[v] = (counts[v] || 0) + 1;
-
-  // Special 6-die combos
-  if (values.length === 6) {
-    // Straight 1-6
-    let isStraight = true;
-    for (let f = 1; f <= 6; f++) {
-      if ((counts[f] || 0) !== 1) {
-        isStraight = false;
-        break;
-      }
-    }
-    if (isStraight) return { ok: true, score: 1500, detail: "Straight (1-6) = 1500" };
-
-    // Three pairs
-    let pairs = 0;
-    for (let f = 1; f <= 6; f++) if ((counts[f] || 0) === 2) pairs++;
-    if (pairs === 3) return { ok: true, score: 1500, detail: "Three pairs = 1500" };
-
-    // Two triplets
-    let triplets = 0;
-    for (let f = 1; f <= 6; f++) if ((counts[f] || 0) === 3) triplets++;
-    if (triplets === 2) return { ok: true, score: 2500, detail: "Two triplets = 2500" };
-  }
-
-  // General scoring (n-of-kind + single 1/5)
-  let score = 0;
-  let detailParts = [];
-
-  // score n-of-kind first (>=3)
-  const remaining = { ...counts };
-  for (let f = 1; f <= 6; f++) {
-    const c = remaining[f] || 0;
-    if (c >= 3) {
-      const base = (f === 1) ? 1000 : (f * 100);
-      const multiplier = Math.pow(2, c - 3); // 3->1, 4->2, 5->4, 6->8
-      const pts = base * multiplier;
-      score += pts;
-      detailParts.push(`${c}x${f} = ${pts}`);
-      remaining[f] -= c; // consume all of that face
-    }
-  }
-
-  // score single 1s and 5s
-  if ((remaining[1] || 0) > 0) {
-    const c = remaining[1];
-    const pts = c * 100;
-    score += pts;
-    detailParts.push(`${c}x1 = ${pts}`);
-    remaining[1] = 0;
-  }
-
-  if ((remaining[5] || 0) > 0) {
-    const c = remaining[5];
-    const pts = c * 50;
-    score += pts;
-    detailParts.push(`${c}x5 = ${pts}`);
-    remaining[5] = 0;
-  }
-
-  // If anything remains, selection included non-scoring dice -> invalid
-  for (let f = 1; f <= 6; f++) {
-    if ((remaining[f] || 0) > 0) {
-      return { ok: false, score: 0, detail: "Selection includes non-scoring dice." };
-    }
-  }
-
-  if (score <= 0) return { ok: false, score: 0, detail: "No scoring dice selected." };
-  return { ok: true, score, detail: detailParts.join(", ") };
-}
-
-function makeFreshTurnState() {
+function newGameState() {
   return {
-    dice: [1, 1, 1, 1, 1, 1],     // values
-    kept: [false, false, false, false, false, false], // whether die is kept this turn
-    canRoll: false,               // must roll to start turn
-    hasRolled: false,
+    stage: "WAITING", // WAITING | IN_PROGRESS | GAME_OVER
+    scores: [0, 0],
+    turnIndex: 0,
+    dice: [0, 0, 0, 0, 0, 0],      // current face values
+    kept: [false, false, false, false, false, false], // kept markers for this turn
+    canRoll: false,   // after joining + game start, current player can roll
+    canKeep: false,
+    canBank: false,
     turnPoints: 0,
-    lastKeepDetail: ""
+    lastAction: "—",
+    winner: null,
+    winningScore: 10000,
   };
 }
 
-function makeNewRoom(roomCode) {
-  return {
-    roomCode,
-    createdAt: Date.now(),
-    players: [
-      { socketId: null, name: "", score: 0 },
-      { socketId: null, name: "", score: 0 }
-    ],
-    started: false,
-    currentTurn: 0, // 0 or 1
-    turn: makeFreshTurnState(),
-    log: [], // small event log strings
-    winnerIndex: null
-  };
-}
+const rooms = new Map();
+// roomCode -> {
+//   code, createdAt,
+//   players: [{name, sid, online}, {name, sid, online}],
+//   game: gameState
+// }
 
 function publicRoomState(room) {
-  // Redact socket IDs, send what UI needs
+  const g = room.game;
   return {
-    roomCode: room.roomCode,
-    started: room.started,
-    currentTurn: room.currentTurn,
-    winnerIndex: room.winnerIndex,
-    players: room.players.map(p => ({ name: p.name, score: p.score, connected: !!p.socketId })),
-    turn: clone(room.turn),
-    log: room.log.slice(-8)
+    code: room.code,
+    players: room.players.map((p) => ({
+      name: p?.name || "—",
+      online: !!p?.online,
+    })),
+    game: {
+      stage: g.stage,
+      scores: g.scores,
+      turnIndex: g.turnIndex,
+      dice: g.dice,
+      kept: g.kept,
+      canRoll: g.canRoll,
+      canKeep: g.canKeep,
+      canBank: g.canBank,
+      turnPoints: g.turnPoints,
+      lastAction: g.lastAction,
+      winner: g.winner,
+      winningScore: g.winningScore,
+    },
   };
 }
 
-function getSeatIndex(room, socketId) {
-  return room.players.findIndex(p => p.socketId === socketId);
+function broadcastRoom(room) {
+  io.to(room.code).emit("room:update", publicRoomState(room));
 }
 
-function otherSeat(seat) {
-  return seat === 0 ? 1 : 0;
+function currentPlayerSid(room) {
+  const p = room.players[room.game.turnIndex];
+  return p?.sid || null;
 }
 
-function roomAddLog(room, msg) {
-  room.log.push(msg);
-  if (room.log.length > 50) room.log.shift();
+function ensureInProgress(room) {
+  const g = room.game;
+  if (room.players[0]?.name && room.players[1]?.name) {
+    if (g.stage === "WAITING") {
+      g.stage = "IN_PROGRESS";
+      g.turnIndex = 0; // player 0 starts
+      g.turnPoints = 0;
+      g.kept = [false, false, false, false, false, false];
+      g.dice = [0, 0, 0, 0, 0, 0];
+      g.canRoll = true;
+      g.canKeep = false;
+      g.canBank = false;
+      g.lastAction = "Both players joined. Player 1 to roll.";
+    }
+  }
 }
 
-function emitRoom(room) {
-  io.to(room.roomCode).emit("room:update", publicRoomState(room));
+function endTurn(room, reasonText) {
+  const g = room.game;
+  g.turnPoints = 0;
+  g.kept = [false, false, false, false, false, false];
+  g.dice = [0, 0, 0, 0, 0, 0];
+  g.turnIndex = g.turnIndex === 0 ? 1 : 0;
+  g.canRoll = true;
+  g.canKeep = false;
+  g.canBank = false;
+  g.lastAction = reasonText || "Turn ended.";
 }
 
-function hardResetGame(room) {
-  room.players[0].score = 0;
-  room.players[1].score = 0;
-  room.started = true;
-  room.currentTurn = 0;
-  room.turn = makeFreshTurnState();
-  room.winnerIndex = null;
-  room.log = [];
-  roomAddLog(room, "New game started. First to 10,000 wins.");
-}
-
-function ensureRoomExists(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room) return null;
-  return room;
+function isMyTurn(room, sid) {
+  return currentPlayerSid(room) === sid;
 }
 
 io.on("connection", (socket) => {
-  console.log("socket connected", socket.id);
-
-  socket.on("disconnect", () => {
-    // Remove from any room seat
-    for (const room of rooms.values()) {
-      const idx = getSeatIndex(room, socket.id);
-      if (idx !== -1) {
-        room.players[idx].socketId = null;
-        roomAddLog(room, `${room.players[idx].name || "Player"} disconnected.`);
-        // If game over? keep state; allow reconnect later (simple approach)
-        emitRoom(room);
-      }
-    }
-  });
+  socket.emit("hello", { ok: true });
 
   socket.on("room:create", ({ name }) => {
-    const cleanName = String(name || "").trim().slice(0, 20) || "Player 1";
-    let code = makeRoomCode();
-    while (rooms.has(code)) code = makeRoomCode();
+    const cleanName = (name || "").trim().slice(0, 20) || "Captain";
+    let code = makeCode(5);
+    while (rooms.has(code)) code = makeCode(5);
 
-    const room = makeNewRoom(code);
+    const room = {
+      code,
+      createdAt: Date.now(),
+      players: [
+        { name: cleanName, sid: socket.id, online: true },
+        null,
+      ],
+      game: newGameState(),
+    };
+
     rooms.set(code, room);
-
-    // Seat creator as P1
-    room.players[0].socketId = socket.id;
-    room.players[0].name = cleanName;
-
-    room.started = false;
-    roomAddLog(room, `${cleanName} created table ${code}. Waiting for opponent...`);
-
     socket.join(code);
-    socket.emit("room:joined", { roomCode: code, seatIndex: 0 });
-    emitRoom(room);
+    room.game.lastAction = `${cleanName} created table. Waiting for opponent…`;
+    broadcastRoom(room);
+    socket.emit("room:joined", { code, seat: 0, name: cleanName });
   });
 
-  socket.on("room:join", ({ roomCode, name }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
+  socket.on("room:join", ({ code, name }) => {
+    const roomCode = (code || "").trim().toUpperCase();
+    const room = rooms.get(roomCode);
     if (!room) {
-      socket.emit("ui:modal", { title: "Table not found", message: `No table named "${code}" exists.` });
-      return;
-    }
-
-    const cleanName = String(name || "").trim().slice(0, 20) || "Player";
-    // Find open seat
-    const openSeat = room.players.findIndex(p => !p.socketId);
-    if (openSeat === -1) {
-      socket.emit("ui:modal", { title: "Table full", message: `Table "${code}" already has 2 players.` });
-      return;
-    }
-
-    room.players[openSeat].socketId = socket.id;
-    room.players[openSeat].name = cleanName;
-    roomAddLog(room, `${cleanName} joined table ${code}.`);
-
-    socket.join(code);
-    socket.emit("room:joined", { roomCode: code, seatIndex: openSeat });
-
-    // Auto-start when both seats filled (and no winner)
-    if (room.players[0].socketId && room.players[1].socketId && !room.started) {
-      room.started = true;
-      room.currentTurn = 0;
-      room.turn = makeFreshTurnState();
-      room.winnerIndex = null;
-      roomAddLog(room, "Both players connected. Game begins!");
-      roomAddLog(room, `${room.players[room.currentTurn].name}'s turn. Tap ROLL.`);
-    }
-
-    emitRoom(room);
-  });
-
-  socket.on("game:new", ({ roomCode }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
-    if (!room) return;
-
-    const seat = getSeatIndex(room, socket.id);
-    if (seat === -1) return;
-
-    // Let either player start a new game
-    hardResetGame(room);
-    roomAddLog(room, `${room.players[room.currentTurn].name}'s turn. Tap ROLL.`);
-    emitRoom(room);
-    io.to(room.roomCode).emit("ui:toast", { message: "New game started." });
-  });
-
-  socket.on("turn:roll", ({ roomCode }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
-    if (!room || !room.started || room.winnerIndex !== null) return;
-
-    const seat = getSeatIndex(room, socket.id);
-    if (seat === -1) return;
-    if (seat !== room.currentTurn) {
-      socket.emit("ui:toast", { message: "Not your turn." });
-      return;
-    }
-
-    // Must be allowed to roll
-    if (room.turn.hasRolled && !room.turn.canRoll) {
-      socket.emit("ui:toast", { message: "You must keep scoring dice or bank." });
-      return;
-    }
-
-    // Roll only unkept dice
-    for (let i = 0; i < 6; i++) {
-      if (!room.turn.kept[i]) room.turn.dice[i] = rollDie();
-    }
-    room.turn.hasRolled = true;
-    room.turn.canRoll = false; // after rolling, you must keep something or you might be farkled
-    room.turn.lastKeepDetail = "";
-
-    // Check for farkle on unkept dice
-    const unkeptValues = [];
-    const counts = {};
-    for (let i = 0; i < 6; i++) {
-      if (!room.turn.kept[i]) {
-        const v = room.turn.dice[i];
-        unkeptValues.push(v);
-        counts[v] = (counts[v] || 0) + 1;
-      }
-    }
-
-    if (!hasAnyScoring(counts)) {
-      // Farkle: lose turn points, end turn
-      roomAddLog(room, `${room.players[seat].name} FARKLED! Turn points lost.`);
-      room.turn.turnPoints = 0;
-      room.turn = makeFreshTurnState();
-      room.currentTurn = otherSeat(room.currentTurn);
-      roomAddLog(room, `${room.players[room.currentTurn].name}'s turn. Tap ROLL.`);
-      io.to(room.roomCode).emit("ui:modal", {
-        title: "FARKLE!",
-        message: `${room.players[seat].name} rolled no scoring dice and loses the turn.`
+      socket.emit("error:modal", {
+        title: "Table not found",
+        body: "That table code doesn’t exist. Check the code and try again.",
       });
-      emitRoom(room);
       return;
     }
 
-    roomAddLog(room, `${room.players[seat].name} rolled.`);
-    emitRoom(room);
-  });
+    const cleanName = (name || "").trim().slice(0, 20) || "Captain";
 
-  socket.on("turn:keep", ({ roomCode, indices }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
-    if (!room || !room.started || room.winnerIndex !== null) return;
-
-    const seat = getSeatIndex(room, socket.id);
-    if (seat === -1) return;
-    if (seat !== room.currentTurn) {
-      socket.emit("ui:toast", { message: "Not your turn." });
-      return;
-    }
-
-    if (!room.turn.hasRolled) {
-      socket.emit("ui:toast", { message: "Roll first." });
-      return;
-    }
-
-    const idxs = Array.isArray(indices) ? indices : [];
-    const unique = [...new Set(idxs.map(n => Number(n)).filter(n => Number.isInteger(n) && n >= 0 && n < 6))];
-    if (unique.length === 0) {
-      socket.emit("ui:toast", { message: "Select dice to keep." });
-      return;
-    }
-
-    // Must be unkept dice only
-    for (const i of unique) {
-      if (room.turn.kept[i]) {
-        socket.emit("ui:toast", { message: "You selected a die that's already kept." });
+    // Try to reclaim seat by name if offline
+    for (let i = 0; i < 2; i++) {
+      const p = room.players[i];
+      if (p && !p.sid && p.name.toLowerCase() === cleanName.toLowerCase()) {
+        p.sid = socket.id;
+        p.online = true;
+        socket.join(roomCode);
+        ensureInProgress(room);
+        room.game.lastAction = `${p.name} rejoined.`;
+        broadcastRoom(room);
+        socket.emit("room:joined", { code: roomCode, seat: i, name: p.name });
         return;
       }
     }
 
-    const values = unique.map(i => room.turn.dice[i]);
-    const scored = scoreSelection(values);
+    // Otherwise fill empty seat
+    if (!room.players[1]) {
+      room.players[1] = { name: cleanName, sid: socket.id, online: true };
+      socket.join(roomCode);
+      ensureInProgress(room);
+      room.game.lastAction = `${cleanName} joined table.`;
+      broadcastRoom(room);
+      socket.emit("room:joined", { code: roomCode, seat: 1, name: cleanName });
+      return;
+    }
+
+    socket.emit("error:modal", {
+      title: "Table full",
+      body: "That table already has two players.",
+    });
+  });
+
+  socket.on("game:new", ({ code }) => {
+    const room = rooms.get((code || "").trim().toUpperCase());
+    if (!room) return;
+
+    // Allow either player to reset
+    const seat = room.players.findIndex((p) => p?.sid === socket.id);
+    if (seat === -1) return;
+
+    room.game = newGameState();
+    ensureInProgress(room);
+    room.game.lastAction = "New game started.";
+    broadcastRoom(room);
+  });
+
+  socket.on("turn:roll", ({ code }) => {
+    const room = rooms.get((code || "").trim().toUpperCase());
+    if (!room) return;
+
+    const g = room.game;
+
+    if (g.stage !== "IN_PROGRESS") return;
+
+    if (!isMyTurn(room, socket.id)) {
+      socket.emit("error:toast", "Not your turn.");
+      return;
+    }
+    if (!g.canRoll) {
+      socket.emit("error:toast", "You can’t roll right now.");
+      return;
+    }
+
+    // Roll all unkept dice
+    for (let i = 0; i < 6; i++) {
+      if (!g.kept[i]) g.dice[i] = rollDie();
+    }
+
+    // Evaluate unkept dice for scoring
+    const unkeptValues = [];
+    const mapIndex = []; // maps unkeptValues position -> die index 0..5
+    for (let i = 0; i < 6; i++) {
+      if (!g.kept[i]) {
+        unkeptValues.push(g.dice[i]);
+        mapIndex.push(i);
+      }
+    }
+
+    const evalRes = evaluateRoll(unkeptValues);
+    const hasScoring = evalRes.selectable.some(Boolean);
+
+    if (!hasScoring) {
+      // FARKLE: lose turn points, end turn immediately
+      g.lastAction = `Farkle! No scoring dice. Turn ends.`;
+      io.to(room.code).emit("modal:show", {
+        title: "Farkle!",
+        body: "No scoring dice. Your turn ends and you bank 0 points.",
+        sticky: true,
+      });
+      endTurn(room, "Farkle — turn passed.");
+      broadcastRoom(room);
+      return;
+    }
+
+    // Player must choose scoring dice to keep (or can roll again only after keep)
+    g.canRoll = false;
+    g.canKeep = true;
+    g.canBank = g.turnPoints > 0; // can bank only if they already have points
+    g.lastAction = `Rolled: ${g.dice.join(", ")}`;
+    broadcastRoom(room);
+
+    // Send selectable map to clients (derived on client too, but keep server truth)
+    io.to(room.code).emit("roll:selectable", {
+      code: room.code,
+      selectable: mapIndex.reduce((acc, dieIndex, pos) => {
+        acc[dieIndex] = evalRes.selectable[pos];
+        return acc;
+      }, {}),
+      comboHint: evalRes.combo,
+      comboConsumesAll: evalRes.comboConsumesAll,
+    });
+  });
+
+  socket.on("turn:keep", ({ code, selected }) => {
+    const room = rooms.get((code || "").trim().toUpperCase());
+    if (!room) return;
+
+    const g = room.game;
+
+    if (g.stage !== "IN_PROGRESS") return;
+
+    if (!isMyTurn(room, socket.id)) {
+      socket.emit("error:toast", "Not your turn.");
+      return;
+    }
+    if (!g.canKeep) {
+      socket.emit("error:toast", "You can’t keep right now.");
+      return;
+    }
+
+    const sel = Array.isArray(selected) ? selected : [];
+    const uniq = Array.from(new Set(sel.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0 && n <= 5)));
+
+    if (uniq.length === 0) {
+      socket.emit("error:toast", "Select scoring dice first.");
+      return;
+    }
+
+    // Cannot keep already-kept dice
+    for (const idx of uniq) {
+      if (g.kept[idx]) {
+        socket.emit("error:toast", "You selected a die that is already kept.");
+        return;
+      }
+    }
+
+    // Score selection values
+    const selectedValues = uniq.map((i) => g.dice[i]);
+    const scored = scoreSelection(selectedValues);
     if (!scored.ok) {
-      socket.emit("ui:toast", { message: `Invalid keep: ${scored.detail}` });
+      socket.emit("error:modal", {
+        title: "Invalid keep",
+        body: scored.detail,
+      });
       return;
     }
 
     // Apply keep
-    for (const i of unique) room.turn.kept[i] = true;
-    room.turn.turnPoints += scored.score;
-    room.turn.lastKeepDetail = scored.detail;
-    room.turn.canRoll = true;
+    for (const idx of uniq) g.kept[idx] = true;
+    g.turnPoints += scored.points;
 
-    roomAddLog(room, `${room.players[seat].name} kept dice (+${scored.score}). Turn = ${room.turn.turnPoints}.`);
-
-    // Hot dice: if all kept, reset kept to allow rolling all 6 again
-    const allKept = room.turn.kept.every(Boolean);
+    // Hot dice?
+    const allKept = g.kept.every(Boolean);
     if (allKept) {
-      roomAddLog(room, `${room.players[seat].name} has HOT DICE! Roll all 6 again.`);
-      room.turn.kept = [false, false, false, false, false, false];
-      room.turn.canRoll = true;
-      io.to(room.roomCode).emit("ui:toast", { message: "HOT DICE! All 6 dice are available again." });
-    }
-
-    emitRoom(room);
-  });
-
-  socket.on("turn:bank", ({ roomCode }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
-    if (!room || !room.started || room.winnerIndex !== null) return;
-
-    const seat = getSeatIndex(room, socket.id);
-    if (seat === -1) return;
-    if (seat !== room.currentTurn) {
-      socket.emit("ui:toast", { message: "Not your turn." });
-      return;
-    }
-
-    if (!room.turn.hasRolled) {
-      socket.emit("ui:toast", { message: "Roll first." });
-      return;
-    }
-
-    if (room.turn.turnPoints <= 0) {
-      socket.emit("ui:toast", { message: "No points to bank." });
-      return;
-    }
-
-    // Bank points
-    const pts = room.turn.turnPoints;
-    room.players[seat].score += pts;
-    roomAddLog(room, `${room.players[seat].name} BANKED ${pts}. Total = ${room.players[seat].score}.`);
-
-    // Win check
-    if (room.players[seat].score >= WIN_SCORE) {
-      room.winnerIndex = seat;
-      roomAddLog(room, `${room.players[seat].name} WINS!`);
-      io.to(room.roomCode).emit("ui:modal", {
-        title: "🏴‍☠️ GAME OVER",
-        message: `${room.players[seat].name} wins with ${room.players[seat].score} points!`
+      // Reset kept to allow rolling all 6 again in same turn
+      g.kept = [false, false, false, false, false, false];
+      g.dice = [0, 0, 0, 0, 0, 0];
+      g.canRoll = true;
+      g.canKeep = false;
+      g.canBank = true; // can bank after scoring
+      g.lastAction = `KEEP ${scored.points} (${scored.detail}). HOT DICE! Roll all 6.`;
+      io.to(room.code).emit("modal:show", {
+        title: "Hot Dice!",
+        body: `You used all 6 dice for scoring and earned ${scored.points} points.\nHot Dice: roll all 6 again.`,
+        sticky: false,
       });
-      emitRoom(room);
+      broadcastRoom(room);
       return;
     }
 
-    // Next turn
-    room.turn = makeFreshTurnState();
-    room.currentTurn = otherSeat(room.currentTurn);
-    roomAddLog(room, `${room.players[room.currentTurn].name}'s turn. Tap ROLL.`);
-    emitRoom(room);
+    // Otherwise: may roll remaining dice or bank
+    g.canRoll = true;
+    g.canKeep = false;
+    g.canBank = true;
+    g.lastAction = `KEEP ${scored.points} (${scored.detail}). Turn points: ${g.turnPoints}.`;
+    broadcastRoom(room);
   });
 
-  socket.on("debug:state", ({ roomCode }) => {
-    const code = String(roomCode || "").trim().toUpperCase();
-    const room = ensureRoomExists(code);
+  socket.on("turn:bank", ({ code }) => {
+    const room = rooms.get((code || "").trim().toUpperCase());
     if (!room) return;
-    socket.emit("debug:state", room);
+
+    const g = room.game;
+
+    if (g.stage !== "IN_PROGRESS") return;
+
+    if (!isMyTurn(room, socket.id)) {
+      socket.emit("error:toast", "Not your turn.");
+      return;
+    }
+    if (!g.canBank) {
+      socket.emit("error:toast", "You can’t bank right now.");
+      return;
+    }
+    if (g.turnPoints <= 0) {
+      socket.emit("error:toast", "You have 0 turn points.");
+      return;
+    }
+
+    const t = g.turnIndex;
+    g.scores[t] += g.turnPoints;
+
+    const scorerName = room.players[t]?.name || `Player ${t + 1}`;
+    const banked = g.turnPoints;
+
+    // Check win
+    if (g.scores[t] >= g.winningScore) {
+      g.stage = "GAME_OVER";
+      g.winner = t;
+      g.lastAction = `${scorerName} BANKED ${banked} and wins with ${g.scores[t]}!`;
+      broadcastRoom(room);
+
+      io.to(room.code).emit("modal:show", {
+        title: "Game Over",
+        body: `${scorerName} wins!\nFinal score: ${g.scores[0]} – ${g.scores[1]}`,
+        sticky: true,
+      });
+      return;
+    }
+
+    // End turn normally
+    io.to(room.code).emit("modal:show", {
+      title: "Banked",
+      body: `${scorerName} banked ${banked} points.\nTurn passes to the other player.`,
+      sticky: false,
+    });
+
+    endTurn(room, `${scorerName} banked ${banked}. Turn passed.`);
+    broadcastRoom(room);
   });
+
+  socket.on("room:sync", ({ code }) => {
+    const room = rooms.get((code || "").trim().toUpperCase());
+    if (!room) return;
+    socket.join(room.code);
+    ensureInProgress(room);
+    broadcastRoom(room);
+  });
+
+  socket.on("disconnect", () => {
+    // Mark any player with this sid as offline
+    for (const room of rooms.values()) {
+      for (let i = 0; i < 2; i++) {
+        const p = room.players[i];
+        if (p && p.sid === socket.id) {
+          p.sid = null;
+          p.online = false;
+          room.game.lastAction = `${p.name} disconnected.`;
+          broadcastRoom(room);
+        }
+      }
+    }
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
 });
