@@ -1,7 +1,7 @@
 {
   "name": "pirate-farkle-plusai",
   "version": "1.0.0",
-  "description": "Farkle game to go with pirate game suite",
+  "description": "Pirate Farkle – two player online",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
