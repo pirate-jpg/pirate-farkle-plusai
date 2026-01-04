@@ -1,415 +1,243 @@
 // public/app.js
-(() => {
-  const $ = (id) => document.getElementById(id);
+/* global io */
 
-  // UI refs (must match your existing index.html)
-  const connPill = $("connPill");
+const socket = io();
 
-  const joinBox = $("joinBox");
-  const tableBox = $("tableBox");
+let roomCode = "";
+let myName = "";
+let lastRoom = null;
 
-  const nameInput = $("nameInput");
-  const createBtn = $("createBtn");
-  const roomInput = $("roomInput");
-  const joinBtn = $("joinBtn");
+// UI refs
+const connPill = document.getElementById("connPill");
 
-  const codeValue = $("codeValue");
-  const p0Name = $("p0Name");
-  const p0Score = $("p0Score");
-  const p0Meta = $("p0Meta");
-  const p1Name = $("p1Name");
-  const p1Score = $("p1Score");
-  const p1Meta = $("p1Meta");
+const joinBox = document.getElementById("joinBox");
+const tableBox = document.getElementById("tableBox");
 
-  const newGameBtn = $("newGameBtn");
+const nameInput = document.getElementById("nameInput");
+const roomInput = document.getElementById("roomInput");
+const createBtn = document.getElementById("createBtn");
+const joinBtn = document.getElementById("joinBtn");
+const newGameBtn = document.getElementById("newGameBtn");
 
-  const turnPointsEl = $("turnPoints");
-  const keepDetailEl = $("keepDetail");
-  const turnTag = $("turnTag");
-  const turnHint = $("turnHint");
+const codeValue = document.getElementById("codeValue");
+const p0Name = document.getElementById("p0Name");
+const p1Name = document.getElementById("p1Name");
+const p0Score = document.getElementById("p0Score");
+const p1Score = document.getElementById("p1Score");
+const p0Meta = document.getElementById("p0Meta");
+const p1Meta = document.getElementById("p1Meta");
 
-  const diceGrid = $("diceGrid");
+const turnPointsEl = document.getElementById("turnPoints");
+const keepDetail = document.getElementById("keepDetail");
+const turnTag = document.getElementById("turnTag");
+const turnHint = document.getElementById("turnHint");
 
-  const rollBtn = $("rollBtn");
-  const keepBtn = $("keepBtn");
-  const bankBtn = $("bankBtn");
+const diceGrid = document.getElementById("diceGrid");
+const rollBtn = document.getElementById("rollBtn");
+const keepBtn = document.getElementById("keepBtn");
+const bankBtn = document.getElementById("bankBtn");
 
-  const logEl = $("log");
+const logEl = document.getElementById("log");
 
-  const modalOverlay = $("modalOverlay");
-  const modalTitle = $("modalTitle");
-  const modalBody = $("modalBody");
-  const modalOkBtn = $("modalOkBtn");
+const modalOverlay = document.getElementById("modalOverlay");
+const modalTitle = document.getElementById("modalTitle");
+const modalBody = document.getElementById("modalBody");
+const modalOkBtn = document.getElementById("modalOkBtn");
 
-  const toastEl = $("toast");
+const toastEl = document.getElementById("toast");
 
-  // Socket
-  const socket = io();
+let selected = [false, false, false, false, false, false];
 
-  // Local client state (render-only)
-  let mySeat = null; // 0 or 1
-  let myName = "";
-  let roomCode = "";
+function setConn(connected) {
+  connPill.textContent = connected ? "Connected" : "Disconnected";
+  connPill.classList.toggle("connected", connected);
+  connPill.classList.toggle("disconnected", !connected);
+}
 
-  let state = null;
-  let selectableMap = {}; // dieIndex -> true/false for current roll
-  let selected = new Set(); // die indices currently selected
+function showToast(msg, ms = 1800) {
+  toastEl.textContent = msg;
+  toastEl.classList.remove("hidden");
+  setTimeout(() => toastEl.classList.add("hidden"), ms);
+}
 
-  // ---------- UI helpers ----------
-  function show(el) {
-    el.classList.remove("hidden");
-  }
-  function hide(el) {
-    el.classList.add("hidden");
-  }
+function showModal(title, body) {
+  modalTitle.textContent = title;
+  modalBody.textContent = body;
+  modalOverlay.classList.remove("hidden");
+}
 
-  function setConn(ok) {
-    if (!connPill) return;
-    connPill.textContent = ok ? "Connected" : "Disconnected";
-    connPill.classList.toggle("ok", ok);
-  }
+function hideModal() {
+  modalOverlay.classList.add("hidden");
+}
 
-  function toast(msg) {
-    if (!toastEl) return;
-    toastEl.textContent = msg;
-    toastEl.classList.remove("hidden");
-    clearTimeout(toastEl._t);
-    toastEl._t = setTimeout(() => toastEl.classList.add("hidden"), 1800);
-  }
+modalOkBtn.addEventListener("click", hideModal);
 
-  function modalShow(title, body, sticky) {
-    modalTitle.textContent = title || "Notice";
-    modalBody.textContent = body || "—";
-    show(modalOverlay);
-    modalOkBtn.dataset.sticky = sticky ? "1" : "0";
-  }
+function getMySeat(room) {
+  if (!room) return -1;
+  const n = (myName || "").trim().toLowerCase();
+  if (!n) return -1;
+  const p0 = (room.players[0]?.name || "").toLowerCase();
+  const p1 = (room.players[1]?.name || "").toLowerCase();
+  if (p0 === n) return 0;
+  if (p1 === n) return 1;
+  return -1;
+}
 
-  function modalHide() {
-    hide(modalOverlay);
-  }
+function render(room) {
+  lastRoom = room;
 
-  modalOkBtn.addEventListener("click", () => {
-    // If sticky, still dismiss; "sticky" here means it MUST be acknowledged
-    modalHide();
-  });
-
-  function logLine(text) {
-    if (!logEl) return;
-    const div = document.createElement("div");
-    div.textContent = text;
-    logEl.appendChild(div);
-    logEl.scrollTop = logEl.scrollHeight;
+  // Top / table box toggles
+  if (room?.code) {
+    joinBox.classList.add("hidden");
+    tableBox.classList.remove("hidden");
+    codeValue.textContent = room.code;
+  } else {
+    joinBox.classList.remove("hidden");
+    tableBox.classList.add("hidden");
   }
 
-  function safeName() {
-    return (nameInput.value || "").trim().slice(0, 20);
+  // Players
+  const players = room.players || [];
+  p0Name.textContent = players[0]?.name ?? "—";
+  p1Name.textContent = players[1]?.name ?? "—";
+  p0Score.textContent = players[0]?.score ?? 0;
+  p1Score.textContent = players[1]?.score ?? 0;
+
+  p0Meta.textContent = players[0]?.online ? "Online" : "Offline";
+  p1Meta.textContent = players[1]?.online ? "Online" : "Offline";
+
+  // Game
+  const g = room.game || {};
+  const mySeat = getMySeat(room);
+
+  // Turn header
+  turnPointsEl.textContent = g.turnPoints ?? 0;
+
+  const status = g.status || "waiting";
+
+  if (status === "over") {
+    turnTag.textContent = "Game over";
+    const winnerSeat = g.winner;
+    const winnerName = winnerSeat === 0 ? players[0]?.name : players[1]?.name;
+    turnHint.textContent = `${winnerName || "Someone"} wins.`;
+    showModal("🏴‍☠️ Game Over", `${winnerName || "Someone"} wins!`);
+  } else if (status === "waiting") {
+    turnTag.textContent = "Waiting…";
+    turnHint.textContent = g.lastAction || "Create or join a table to begin.";
+  } else {
+    // playing
+    const turnIndex = g.turnIndex ?? 0;
+    const turnName = players[turnIndex]?.name || "—";
+    const isMyTurn = mySeat !== -1 && turnIndex === mySeat;
+
+    turnTag.textContent = isMyTurn ? "Your turn" : "Opponent’s turn";
+    turnHint.textContent = g.lastAction || (isMyTurn ? "Press ROLL." : `Waiting for ${turnName}…`);
   }
 
-  function safeCode() {
-    return (roomInput.value || "").trim().toUpperCase();
-  }
+  // Controls
+  const isPlaying = status === "playing";
+  const myTurn = isPlaying && (g.turnIndex === getMySeat(room));
+  rollBtn.disabled = !myTurn || !g.canRoll;
+  keepBtn.disabled = !myTurn || g.canRoll; // must have just rolled (canRoll false) to keep
+  bankBtn.disabled = !myTurn || (g.turnPoints || 0) <= 0;
 
-  // Dice rendering
-  function dieFaceEmoji(n) {
-    // Use simple pip glyphs (consistent on iOS/desktop)
-    const map = {
-      1: "⚀",
-      2: "⚁",
-      3: "⚂",
-      4: "⚃",
-      5: "⚄",
-      6: "⚅",
-    };
-    return map[n] || "□";
-  }
+  // Dice render
+  renderDice(g.dice || [1, 1, 1, 1, 1, 1], g.kept || [false, false, false, false, false, false], myTurn, g.canRoll);
 
-  function clearSelections() {
-    selected.clear();
-  }
+  // Log
+  const logLines = (g.log || []).slice(-10).map((x) => `• ${x.msg}`);
+  logEl.textContent = logLines.join("\n") || "";
+}
 
-  function canInteract() {
-    if (!state) return false;
-    if (mySeat === null) return false;
-    if (state.game.stage !== "IN_PROGRESS") return false;
-    return true;
-  }
+function dieFace(d) {
+  // simple dots, but keep it pirate-ish
+  const faces = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
+  return faces[d] || String(d);
+}
 
-  function isMyTurn() {
-    if (!state) return false;
-    return mySeat === state.game.turnIndex;
-  }
+function renderDice(dice, kept, myTurn, canRoll) {
+  diceGrid.innerHTML = "";
+  const canSelect = myTurn && !canRoll; // after roll, before keep/bank
 
-  function updateButtons() {
-    if (!state) return;
+  for (let i = 0; i < 6; i++) {
+    const btn = document.createElement("button");
+    btn.className = "die";
+    if (kept[i]) btn.classList.add("kept");
+    if (selected[i]) btn.classList.add("selected");
 
-    const g = state.game;
-    const myTurn = isMyTurn();
+    btn.innerHTML = `<div class="dieFace">${dieFace(dice[i])}</div><div class="dieNum">${dice[i]}</div>`;
 
-    rollBtn.disabled = !(canInteract() && myTurn && g.canRoll);
-    keepBtn.disabled = !(canInteract() && myTurn && g.canKeep);
-    bankBtn.disabled = !(canInteract() && myTurn && g.canBank);
+    btn.disabled = !canSelect || kept[i];
 
-    // KEEP needs at least 1 selected die
-    if (!keepBtn.disabled) {
-      keepBtn.disabled = selected.size === 0;
-    }
-  }
-
-  function renderDice() {
-    if (!state) return;
-    const g = state.game;
-
-    diceGrid.innerHTML = "";
-    clearSelections();
-    selectableMap = selectableMap || {};
-
-    // Show only if game is in progress
-    if (g.stage !== "IN_PROGRESS") {
-      updateButtons();
-      return;
-    }
-
-    for (let i = 0; i < 6; i++) {
-      const v = g.dice[i];
-      const kept = g.kept[i];
-      const isSelectable = !!selectableMap[i] && !kept && v !== 0;
-
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "die";
-
-      // basic classes (your CSS can style these)
-      if (kept) btn.classList.add("kept");
-      if (isSelectable) btn.classList.add("selectable");
-      if (selected.has(i)) btn.classList.add("selected");
-
-      btn.textContent = v ? dieFaceEmoji(v) : "□";
-
-      btn.addEventListener("click", () => {
-        if (!canInteract()) return;
-        if (!isMyTurn()) return;
-        if (!state.game.canKeep) return;
-
-        // only allow selecting dice that server marked selectable (for the last roll)
-        if (!isSelectable) return;
-
-        if (selected.has(i)) selected.delete(i);
-        else selected.add(i);
-
-        // re-render selection classes without rebuilding everything
-        renderDiceSelectionOnly();
-        updateButtons();
-      });
-
-      diceGrid.appendChild(btn);
-    }
-
-    updateButtons();
-  }
-
-  function renderDiceSelectionOnly() {
-    // updates button classes without recomputing content
-    const buttons = diceGrid.querySelectorAll("button.die");
-    buttons.forEach((btn, idx) => {
-      btn.classList.toggle("selected", selected.has(idx));
+    btn.addEventListener("click", () => {
+      selected[i] = !selected[i];
+      renderDice(dice, kept, myTurn, canRoll);
     });
+
+    diceGrid.appendChild(btn);
   }
 
-  function render() {
-    if (!state) return;
+  keepDetail.textContent = canSelect
+    ? "Select scoring dice, then press KEEP."
+    : (myTurn ? "Press ROLL or BANK." : "—");
+}
 
-    // Join vs Table view
-    if (roomCode) {
-      hide(joinBox);
-      show(tableBox);
-      codeValue.textContent = roomCode;
-    } else {
-      show(joinBox);
-      hide(tableBox);
-    }
+// Actions
+createBtn.addEventListener("click", () => {
+  myName = (nameInput.value || "").trim() || "Captain";
+  socket.emit("room:create", { name: myName });
+});
 
-    // Players
-    const p0 = state.players[0];
-    const p1 = state.players[1];
+joinBtn.addEventListener("click", () => {
+  myName = (nameInput.value || "").trim() || "Captain";
+  const code = (roomInput.value || "").trim().toUpperCase();
+  if (!code) return showToast("Enter a table code.");
+  socket.emit("room:join", { code, name: myName });
+});
 
-    p0Name.textContent = p0?.name || "—";
-    p1Name.textContent = p1?.name || "—";
+newGameBtn.addEventListener("click", () => {
+  if (!roomCode) return;
+  socket.emit("game:new", { code: roomCode });
+  showToast("New game requested.");
+});
 
-    p0Meta.textContent = p0?.online ? "Online" : "Offline";
-    p1Meta.textContent = p1?.online ? "Online" : "Offline";
+rollBtn.addEventListener("click", () => {
+  if (!roomCode) return;
+  selected = [false, false, false, false, false, false];
+  socket.emit("game:roll", { code: roomCode });
+});
 
-    p0Score.textContent = String(state.game.scores?.[0] ?? 0);
-    p1Score.textContent = String(state.game.scores?.[1] ?? 0);
+keepBtn.addEventListener("click", () => {
+  if (!roomCode) return;
+  socket.emit("game:keep", { code: roomCode, select: selected });
+  selected = [false, false, false, false, false, false];
+});
 
-    // Turn / status
-    const g = state.game;
+bankBtn.addEventListener("click", () => {
+  if (!roomCode) return;
+  selected = [false, false, false, false, false, false];
+  socket.emit("game:bank", { code: roomCode });
+});
 
-    turnPointsEl.textContent = String(g.turnPoints ?? 0);
+// Socket events
+socket.on("connect", () => {
+  setConn(true);
+  // ✅ critical: include name so server can reclaim seat on reconnect
+  if (roomCode) socket.emit("room:sync", { code: roomCode, name: myName });
+});
 
-    const myTurn = isMyTurn();
-    const stage = g.stage;
+socket.on("disconnect", () => setConn(false));
 
-    if (!roomCode) {
-      turnTag.textContent = "Waiting…";
-      turnHint.textContent = "Create or join a table to begin.";
-    } else if (stage === "WAITING") {
-      turnTag.textContent = "Waiting…";
-      turnHint.textContent = "Waiting for a second player to join.";
-    } else if (stage === "GAME_OVER") {
-      turnTag.textContent = "Game over";
-      const winner = g.winner === 0 ? p0?.name : p1?.name;
-      turnHint.textContent = `${winner || "Someone"} won. Press New game to play again.`;
-    } else {
-      turnTag.textContent = myTurn ? "Your turn" : "Opponent’s turn";
-      turnHint.textContent = myTurn
-        ? (g.canRoll ? "Press ROLL." : g.canKeep ? "Select scoring dice, then press KEEP." : g.canBank ? "BANK or ROLL." : "Waiting…")
-        : "Waiting for opponent…";
-    }
+socket.on("room:update", (payload) => {
+  roomCode = payload.code || roomCode;
+  render(payload);
+});
 
-    // Keep detail / last action
-    keepDetailEl.textContent = g.lastAction || "—";
+socket.on("toast", (t) => {
+  showToast(t?.msg || "Something happened.");
+});
 
-    // Dice + buttons
-    renderDice();
-
-    // Log (keep it simple: show last actions as they change)
-    // We'll add one log line per state update (not too spammy)
-    if (g.lastAction && (!render._lastAction || render._lastAction !== g.lastAction)) {
-      logLine(g.lastAction);
-      render._lastAction = g.lastAction;
-    }
-
-    updateButtons();
-  }
-
-  // ---------- Socket events ----------
-  socket.on("connect", () => {
-    setConn(true);
-    if (roomCode) socket.emit("room:sync", { code: roomCode });
-  });
-
-  socket.on("disconnect", () => {
-    setConn(false);
-  });
-
-  socket.on("hello", () => {
-    setConn(true);
-  });
-
-  socket.on("room:joined", ({ code, seat, name }) => {
-    roomCode = code;
-    mySeat = seat;
-    myName = name;
-    toast(`Joined table ${code}`);
-    socket.emit("room:sync", { code: roomCode });
-  });
-
-  socket.on("room:update", (st) => {
-    state = st;
-
-    // If room exists but we haven't recorded code (e.g. reload), keep it.
-    if (st?.code && !roomCode) roomCode = st.code;
-
-    // If mySeat is unknown after reload, attempt to infer (best-effort)
-    // (We can't know reliably without server session; keep mySeat as-is.)
-    render();
-  });
-
-  socket.on("roll:selectable", ({ selectable, comboHint, comboConsumesAll }) => {
-    selectableMap = selectable || {};
-    clearSelections();
-
-    if (comboHint && comboConsumesAll) {
-      toast(`Combo available: ${comboHint}`);
-    } else {
-      // normal roll
-      // no toast needed every time
-    }
-
-    renderDice();
-    updateButtons();
-  });
-
-  socket.on("modal:show", ({ title, body, sticky }) => {
-    modalShow(title, body, sticky);
-  });
-
-  socket.on("error:modal", ({ title, body }) => {
-    modalShow(title || "Error", body || "—", true);
-  });
-
-  socket.on("error:toast", (msg) => {
-    toast(msg || "Error");
-  });
-
-  // ---------- Button handlers ----------
-  createBtn.addEventListener("click", () => {
-    const name = safeName();
-    if (!name) {
-      modalShow("Name required", "Please enter your name first.", true);
-      return;
-    }
-    socket.emit("room:create", { name });
-  });
-
-  joinBtn.addEventListener("click", () => {
-    const name = safeName();
-    const code = safeCode();
-    if (!name) {
-      modalShow("Name required", "Please enter your name first.", true);
-      return;
-    }
-    if (!code) {
-      modalShow("Code required", "Please enter a table code.", true);
-      return;
-    }
-    socket.emit("room:join", { code, name });
-  });
-
-  newGameBtn.addEventListener("click", () => {
-    if (!roomCode) return;
-    socket.emit("game:new", { code: roomCode });
-  });
-
-  rollBtn.addEventListener("click", () => {
-    if (!roomCode) return;
-    if (!isMyTurn()) {
-      toast("Not your turn.");
-      return;
-    }
-    // Clear old selection map; server will send fresh selectable after roll
-    selectableMap = {};
-    clearSelections();
-    socket.emit("turn:roll", { code: roomCode });
-  });
-
-  keepBtn.addEventListener("click", () => {
-    if (!roomCode) return;
-    if (!isMyTurn()) {
-      toast("Not your turn.");
-      return;
-    }
-    const arr = Array.from(selected);
-    if (arr.length === 0) {
-      toast("Select scoring dice first.");
-      return;
-    }
-    socket.emit("turn:keep", { code: roomCode, selected: arr });
-    // client clears selection; server state will come back
-    clearSelections();
-    updateButtons();
-  });
-
-  bankBtn.addEventListener("click", () => {
-    if (!roomCode) return;
-    if (!isMyTurn()) {
-      toast("Not your turn.");
-      return;
-    }
-    socket.emit("turn:bank", { code: roomCode });
-  });
-
-  // Initial UI state
-  setConn(false);
-  render();
-})();
+// Set defaults
+nameInput.value = "Captain Jim";
+roomInput.value = "";
+setConn(false);
