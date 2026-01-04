@@ -1,12 +1,130 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Pirate Farkle</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <h1>🏴‍☠️ Pirate Farkle</h1>
-  <p>Server connected. UI coming next.</p>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">🏴‍☠️</div>
+        <div class="titleblock">
+          <div class="title">Pirate Farkle</div>
+          <div class="subtitle">Two-player online · First to 10,000</div>
+        </div>
+      </div>
+
+      <div class="statuspill" id="connPill">Disconnected</div>
+    </header>
+
+    <main class="grid">
+      <!-- LEFT: Table / Players -->
+      <section class="panel">
+        <h2>Table</h2>
+
+        <div class="joinbox" id="joinBox">
+          <div class="field">
+            <label>Your name</label>
+            <input id="nameInput" placeholder="Captain Jim" maxlength="20" />
+          </div>
+
+          <div class="joinrow">
+            <button class="btn primary" id="createBtn">Create table</button>
+          </div>
+
+          <div class="divider">or</div>
+
+          <div class="field">
+            <label>Join table code</label>
+            <input id="roomInput" placeholder="ABCDE" maxlength="8" autocapitalize="characters" />
+          </div>
+
+          <div class="joinrow">
+            <button class="btn" id="joinBtn">Join table</button>
+          </div>
+
+          <p class="hint">
+            Tip: Create on one device, then join from the other device using the same table code.
+          </p>
+        </div>
+
+        <div class="tablebox hidden" id="tableBox">
+          <div class="tablecode">
+            <div class="codeLabel">Table code</div>
+            <div class="codeValue" id="codeValue">—</div>
+          </div>
+
+          <div class="players">
+            <div class="playerCard" id="p0Card">
+              <div class="playerName" id="p0Name">—</div>
+              <div class="playerScore" id="p0Score">0</div>
+              <div class="playerMeta" id="p0Meta">—</div>
+            </div>
+            <div class="playerCard" id="p1Card">
+              <div class="playerName" id="p1Name">—</div>
+              <div class="playerScore" id="p1Score">0</div>
+              <div class="playerMeta" id="p1Meta">—</div>
+            </div>
+          </div>
+
+          <div class="actionsRow">
+            <button class="btn danger" id="newGameBtn">New game</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT: Game -->
+      <section class="panel">
+        <h2>Play</h2>
+
+        <div class="gameHeader">
+          <div class="bigStat">
+            <div class="bigLabel">Turn points</div>
+            <div class="bigValue" id="turnPoints">0</div>
+            <div class="smallHint" id="keepDetail">—</div>
+          </div>
+
+          <div class="turnStatus">
+            <div class="tag" id="turnTag">Waiting…</div>
+            <div class="smallHint" id="turnHint">Create or join a table to begin.</div>
+          </div>
+        </div>
+
+        <div class="diceWrap">
+          <div class="diceGrid" id="diceGrid"></div>
+          <div class="diceNote">Tap dice to select them, then press KEEP.</div>
+        </div>
+
+        <div class="controls">
+          <button class="btn primary" id="rollBtn">ROLL</button>
+          <button class="btn" id="keepBtn">KEEP</button>
+          <button class="btn success" id="bankBtn">BANK</button>
+        </div>
+
+        <div class="logBox">
+          <div class="logTitle">Log</div>
+          <div class="log" id="log"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Sticky modal overlay -->
+  <div class="modalOverlay hidden" id="modalOverlay">
+    <div class="modalCard">
+      <div class="modalTitle" id="modalTitle">Notice</div>
+      <div class="modalBody" id="modalBody">—</div>
+      <button class="btn primary modalBtn" id="modalOkBtn">OK</button>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
