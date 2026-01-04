@@ -1,7 +1,7 @@
 {
   "name": "pirate-farkle-plusai",
   "version": "1.0.0",
-  "description": "Pirate Farkle (2-player online) - First to 10,000",
+  "description": "Pirate Farkle two-player online (Railway) - first to 10,000",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
